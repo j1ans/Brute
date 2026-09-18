@@ -26,29 +26,38 @@ Then copy `brute` to the device (e.g. to the writable data partition) and run it
 scp -O -P <port> brute root@localhost:/mnt2/tmp/
 ssh -p <port> root@localhost
 chmod +x /mnt2/tmp/brute
-/mnt2/tmp/brute -k -r 5 /mnt2/tmp/dict_0000_9999.txt
+/mnt2/tmp/brute -n 4
 ```
 
 ## Usage
 
 ```
-brute [-k] [-r N] <dictionary_file> [keybag_path]
-brute -K <passcode> [keybag_path]    # single candidate test
-brute -D                             # dump effaceable storage / device keys
+brute -n <digits>                     # numeric mode: 0000..10^n-1
+brute -k <dict_file>                  # dictionary mode (mixed/alphanumeric passcodes)
+brute -K <passcode>                   # single candidate test
+brute -D                              # dump effaceable storage / device keys
 ```
 
-| Mode | Meaning |
+Options:
+
+| Option | Meaning |
 |---|---|
-| default | userland passcode-key recompute (the pre-A7 "no-SEP" path) — see note below |
-| `-k` | kernel **AppleKeyStore** path — this is the one that works on A7 |
-| `-r N` | rebuild the keybag handle + user-client connection every N consecutive failures (SEP throttle dodge) |
-| `-K` | try one passcode, print the kernel verdict |
-| `-D` | dump effaceable bytes, key835/key89B (diagnostics) |
+| `-n N` | brute-force all N-digit numeric passcodes (1-10 digits) |
+| `-k FILE` | brute-force a dictionary file — one candidate per line, for mixed/alphanumeric passcodes |
+| `-u` | userland passcode-key recompute instead of the kernel path (the pre-A7 "no-SEP" research path — does not work on A7, see below) |
+| `--disable-keybag-reset` | turn **off** the keybag-handle reset (it is **on by default**) |
+| `--keybag-reset-time N` | rebuild the keybag handle + user-client connection every N consecutive failures (default 5) |
 
-Dictionary format: one candidate per line (e.g. `dict/dict_0000_9999.txt`).
-Default keybag path: `/mnt2/keybags/systembag.kb`.
-
+Verification always goes through the kernel **AppleKeyStore** user client (SEP-backed) unless `-u` is given.
+Default keybag path: `/mnt2/keybags/systembag.kb` (positional override).
 A hit prints `*** FOUND ***` and exits 0.
+
+Typical run:
+
+```sh
+/mnt2/tmp/brute -n 4                       # all 4-digit passcodes, ~31 min
+/mnt2/tmp/brute -k /mnt2/tmp/wordlist.txt  # mixed passcodes from a wordlist
+```
 
 ## How the iOS 7/8 64-bit (A7) port was fixed
 
@@ -91,21 +100,21 @@ The fix is to verify passcodes **exactly like a non-SEP device does at the API l
 
 With the SEP alive (loaded via the stock `seputil --load` flow), the SEP executes underneath and the verdict is authoritative. `brute -k` is this path.
 
-### 4. SEP throttle and the `-r N` dodge
+### 4. SEP throttle and the keybag-handle reset (on by default)
 
 After ~5-6 consecutive failed `UnlockDevice` calls the SEP imposes a **~5 s delay per attempt** (128 ms → 5134 ms observed). Two properties defeat it:
 
 - a **successful unlock resets** the consecutive-failure counter, and
 - the counter is bound to the keybag handle / user-client connection.
 
-`-r 5` therefore rebuilds the handle + connection every 5 failures (selector 4 release, close, re-create). Measured effect: attempts stay at **~128-136 ms** forever (20-in-a-row test: all fast, 4 silent rebuilds, ~185 ms amortized).
+The tool therefore rebuilds the handle + connection every 5 failures by default (selector 4 release, close, re-create; `--disable-keybag-reset` / `--keybag-reset-time N` to control). Measured effect: attempts stay at **~128-136 ms** forever (20-in-a-row test: all fast, 4 silent rebuilds, ~185 ms amortized).
 
 ### 5. Performance
 
 | | observed |
 |---|---|
 | per attempt | 128 ms (iOS 8.3) / 136 ms (iOS 7.1.2) |
-| amortized with `-r 5` | ~185-195 ms |
+| amortized with the default reset | ~185-195 ms |
 | full 0000-9999 | **~31 minutes** (throttled: ~14 h) |
 
 ## Requirements
