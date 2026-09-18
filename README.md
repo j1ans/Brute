@@ -125,6 +125,13 @@ The tool therefore rebuilds the handle + connection every 5 failures by default 
 - kext mode needs only the `AppleKeyStore` service and a readable keybag — the plaintext BAG1 locker means **no UID-AES kernel patch is required** for `-k` (device keys are still derived and printed when the patch is present; userland mode needs it)
 - iOS 7.1.2 needed no code changes beyond the deployment target
 
+## TODO
+
+- [ ] iOS 9 64-bit support
+- [ ] 32-bit support
+- [ ] 32-bit long (alphanumeric) passcodes
+- [ ] Legacy devices: iPhone 2G / 3G, iPod touch 1 / 2
+
 ## Credits
 
 - **iPhone-protection** — [dinosec/iphone-dataprotection](https://github.com/dinosec/iphone-dataprotection) (Sogeti R&D / Jean-Baptiste Beliard, Jean Sigwald, Raul Siles): the passcode KDF, keybag parsing, key-wrap and IOKit glue this tool is derived from (`ramdisk_tools`, `bsdcrypto`)
