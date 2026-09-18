@@ -1,2 +1,4 @@
 brute
+brute_*
+*.arm64
 *.o
