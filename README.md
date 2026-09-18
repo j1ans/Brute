@@ -1,5 +1,7 @@
 # Brute
 
+> **brute requires an alive SEP to work. Please use [qwqramdisk](https://github.com/j1ans/qwqramdisk) instead of other ramdisks.**
+
 On-device passcode brute-force for **64-bit A7 devices (iPhone 5S, iPhone6,1/6,2)** running **iOS 7.1.x / 8.x**, executed inside a pwned-iBoot (checkm8) SSH ramdisk where the data partition `/mnt2` is mounted read-write with the `protect` flag.
 
 Adapted to arm64 / iOS 7-8 / A7 from the classic
